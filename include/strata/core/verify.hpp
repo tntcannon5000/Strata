@@ -124,6 +124,16 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
+    // Diagnostic only, after a completed run/run_batch; never called in timing runs.
+    bool diagnostic_logits(std::vector<float>& values, std::string& err) const {
+        if (!head_logits_ || n_vocab_ <= 0) { err = "diagnostic: missing logits"; return false; }
+        values.resize((size_t) n_vocab_);
+        if (cudaMemcpy(values.data(), head_logits_, values.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "diagnostic: logits copy failed"; return false;
+        }
+        return true;
+    }
+
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
@@ -145,6 +155,8 @@ public:
     double ms_batch_capture = 0;
     int64_t batch_captures = 0;
     double batch_gpu_ms[4] = {}; // member pre, shared expert dispatch, member post, head
+    double batch_member_pre_ms[2][19] = {}; // first member only, not additive across concurrent streams
+    double batch_expert_ms[6] = {}; // wait-plan, resident, fetch, PCIe, wait-CPU, combine
     int64_t windows = 0;
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.

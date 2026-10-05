@@ -1,5 +1,6 @@
 #include "strata/program/concurrent_serve.hpp"
 #include "strata/program/batch_schedule.hpp"
+#include "strata/program/prefill_yield.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/progress.hpp"
@@ -15,11 +16,13 @@
 #include <cstdlib>
 #include <cstdio>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace strata::program {
 namespace {
@@ -205,10 +208,60 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     auto& m = *impl_;
     const auto& c = m.config;
     const auto& g = *m.geometry;
+    // A separate diagnostic execution mode: force an identical continuation,
+    // commit one position per round and record full, unsampled row-zero logits.
+    // Speculative proposals still execute, but cannot change the compared prefix.
+    std::unordered_map<uint64_t, std::vector<int32_t>> forced;
+    std::ofstream numerical_trace;
+    const char* force_path = std::getenv("STRATA_DIAGNOSTIC_FORCE");
+    const char* trace_path = std::getenv("STRATA_DIAGNOSTIC_LOGITS");
+    if (force_path || trace_path) {
+        if (!force_path || !trace_path) { err = "diagnostic: force and logits paths required together"; return 1; }
+        std::ifstream file(force_path);
+        uint64_t id; size_t count;
+        while (file >> id >> count) {
+            if (!id || !count || count > (size_t)c.context || forced.count(id)) { err = "diagnostic: invalid fixture"; return 1; }
+            auto& tokens = forced[id]; tokens.resize(count);
+            for (auto& token : tokens)
+                if (!(file >> token) || token < 0 || token >= wt.find("output.weight")->ne1) {
+                    err = "diagnostic: invalid forced token"; return 1;
+                }
+        }
+        if (!file.eof() || forced.empty()) { err = "diagnostic: unreadable fixture"; return 1; }
+        numerical_trace.open(trace_path, std::ios::binary | std::ios::trunc);
+        if (!numerical_trace) { err = "diagnostic: cannot open logits output"; return 1; }
+        std::fprintf(stderr, "strata diagnostic: teacher forcing active; timings NOT performance evidence\n");
+    }
     if (!head || !head->loaded() || !wt.find("output.weight")) { err = "concurrency: native head required"; return 1; }
     if (!source || !host_res || !hits.d_res || cache.slots() < 1) {
         err = "concurrency: no profile-filled expert cache fits; reduce context/concurrency or increase available VRAM";
         return 1;
+    }
+    const char* yield_env = std::getenv("STRATA_PREFILL_YIELD");
+    const bool prefill_yield = c.requests > 1 && yield_env && std::string(yield_env) == "1";
+    double yield_interval_ms = 100.0;
+    int64_t yield_calls = 0, yield_adaptations = 0;
+    double yield_decode_ms = 0;
+    if (prefill_yield) {
+#if defined(STRATA_USE_HIP)
+        err = "concurrency: STRATA_PREFILL_YIELD prototype is CUDA-only";
+        return 1;
+#endif
+        if (c.prefill_chunk < 1 || c.prefill_chunk > 1024) {
+            err = "concurrency: STRATA_PREFILL_YIELD requires prefill_chunk in [1, 1024]";
+            return 1;
+        }
+        if (const char* interval = std::getenv("STRATA_PREFILL_YIELD_MS")) {
+            char* end = nullptr;
+            yield_interval_ms = std::strtod(interval, &end);
+            if (end == interval || *end != '\0' || !std::isfinite(yield_interval_ms) ||
+                yield_interval_ms < 1.0 || yield_interval_ms > 1000.0) {
+                err = "concurrency: STRATA_PREFILL_YIELD_MS must be in [1, 1000]";
+                return 1;
+            }
+        }
+        std::fprintf(stderr, "strata concurrent: experimental prefill yield every >=%.1f ms at routing barriers; "
+                             "chunk=%d; cache adaptation coalesced until chunk end\n", yield_interval_ms, c.prefill_chunk);
     }
     struct ProgressGuard { ~ProgressGuard() { core::progress().busy.store(false); } } progress_guard;
     std::jthread watchdog; // outlives the batch graph, including teardown after a failed GPU execution
@@ -244,6 +297,14 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
     int64_t rounds = 0;
     int64_t batch_sizes[5]{};
     const bool profiling = std::getenv("STRATA_CONCURRENT_PROFILE") != nullptr;
+    const char* draft_batch_env = std::getenv("STRATA_BATCH_DRAFT");
+    const bool parallel_drafts = draft_batch_env && std::atoi(draft_batch_env) != 0;
+    const char* policy_env = std::getenv("STRATA_DETERMINISTIC_DRAFT_POLICY");
+    const auto policy_costs = policy_env && std::atoi(policy_env) != 0
+        ? spec::DraftPolicy::CostMode::FixedShape : spec::DraftPolicy::CostMode::Measured;
+    std::fprintf(stderr, "strata concurrent: draft policy costs=%s overlap=%d\n",
+                 policy_costs == spec::DraftPolicy::CostMode::FixedShape ? "fixed-shape" : "measured", parallel_drafts);
+    const bool trace_rounds = std::getenv("STRATA_CONCURRENT_TRACE") != nullptr;
     double target_ms = 0, draft_ms = 0, commit_ms = 0, adapt_ms = 0, prefill_ms = 0;
     int64_t produced = 0, target_rows = 0;
     auto report_profile = [&]() {
@@ -262,6 +323,26 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                      "gpu_experts_ms=%.1f gpu_post_ms=%.1f gpu_head_ms=%.1f\n",
                      (long long) batch.batch_captures, batch.ms_batch_capture, batch.batch_gpu_ms[0],
                      batch.batch_gpu_ms[1], batch.batch_gpu_ms[2], batch.batch_gpu_ms[3]);
+        if (std::getenv("STRATA_VERIFY_PROFILE"))
+            std::fprintf(stderr, "strata concurrent experts: plan_wait_ms=%.1f resident_ms=%.1f fetch_ms=%.1f pcie_ms=%.1f cpu_wait_ms=%.1f combine_ms=%.1f\n",
+                         batch.batch_expert_ms[0], batch.batch_expert_ms[1], batch.batch_expert_ms[2],
+                         batch.batch_expert_ms[3], batch.batch_expert_ms[4], batch.batch_expert_ms[5]);
+        if (std::getenv("STRATA_EXPERT_PROFILE")) {
+            std::fprintf(stderr, "strata concurrent routing: layers=%lld all_hit=%lld distinct=%lld misses=%lld resident_groups=",
+                         (long long) dispatch.profile_layers, (long long) dispatch.profile_all_hit,
+                         (long long) dispatch.profile_distinct, (long long) dispatch.profile_misses);
+            for (int i = 1; i <= 16; ++i) std::fprintf(stderr, "%s%d:%lld", i == 1 ? "" : ",", i, (long long) dispatch.profile_groups[i]);
+            std::fprintf(stderr, "\n");
+        }
+        if (std::getenv("STRATA_VERIFY_PROFILE")) {
+            for (int kind = 0; kind < 2; ++kind) {
+                std::fprintf(stderr, "strata concurrent first-member pre: kind=%s", kind ? "QSA" : "GDN");
+                for (int i = 1; i <= 18; ++i)
+                    if (batch.batch_member_pre_ms[kind][i] > 0)
+                        std::fprintf(stderr, " stage%d_ms=%.1f", i, batch.batch_member_pre_ms[kind][i]);
+                std::fprintf(stderr, "\n");
+            }
+        }
     };
     auto adapt = [&]() -> bool {
         // All target, commit, prefill and draft work has finished at this boundary. Updating both
@@ -353,76 +434,15 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
         live.erase(s.request.id);
         s.active = false;
     };
-    bool quitting = false;
-    while (!quitting) {
-        core::progress().busy.store(!live.empty());
-        std::deque<std::string> commands;
-        {
-            std::unique_lock<std::mutex> lock(input->mutex);
-            if (live.empty() && pending.empty()) input->cv.wait(lock, [&] { return !input->lines.empty() || input->eof; });
-            commands.swap(input->lines);
-            if (input->eof && commands.empty()) quitting = true;
-            input->cv.notify_all();
-        }
-        for (const auto& line : commands) {
-            if (line == "QUIT") { quitting = true; break; }
-            if (line.rfind("CSTOP ", 0) == 0) {
-                uint64_t id = 0; std::istringstream(line.substr(6)) >> id;
-                for (auto& s : m.slots) if (s->active && s->request.id == id) finish(*s, "cancel");
-                for (auto p = pending.begin(); p != pending.end();) {
-                    if (p->id == id) { error(id, "cancelled before admission"); live.erase(id); p = pending.erase(p); }
-                    else ++p;
-                }
-                continue;
-            }
-            Request request;
-            std::string reason;
-            if (!parse_request(line, c, wt.find("output.weight")->ne1, request, reason)) { error(request.id, reason); continue; }
-            if (live.count(request.id)) { error(request.id, "duplicate request id"); continue; }
-            if (pending.size() >= 16) { error(request.id, "request queue is full"); continue; }
-            live.insert(request.id);
-            pending.push_back(std::move(request));
-        }
-        if (quitting) break;
-        core::progress().busy.store(!live.empty());
-        for (auto& ptr : m.slots) if (!ptr->active && !pending.empty()) {
-            auto& s = *ptr;
-            s.request = std::move(pending.front()); pending.pop_front();
-            s.read = s.generated = s.offered = s.accepted = 0;
-            s.prompt_ms = 0; s.first = true; s.active = true;
-            s.position = (int64_t) s.request.tokens.size() - 1;
-            s.current = (int32_t) s.request.tokens.back();
-            s.consumed.clear();
-            std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
-            s.suffix.reset(); s.policy = spec::DraftPolicy{c.window};
-            for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
-            core::session_zero(*s.state, g, nullptr, m.prompt_stream);
-            if (cudaStreamSynchronize(m.prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return 1; }
-            s.draft->reset(); s.draft->set_prompt_len((int64_t) s.request.tokens.size());
-            s.verify.set_sampling(s.request.sampling);
-        }
-        // At most ONE bounded prompt chunk before returning to ready decoders.
-        core::progress().busy.store(!live.empty());
-        for (size_t j = 0; j < m.slots.size(); ++j) {
-            const size_t i = (prompt_rotation + j) % m.slots.size();
-            auto& s = *m.slots[i];
-            if (!s.active || s.read >= s.position) continue;
-            const auto start = Clock::now();
-            const auto n = std::min<int64_t>(c.prefill_chunk, s.position - s.read);
-            if (!s.prompt.run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
-            for (int64_t t = 0; t < n; ++t) s.consumed.push_back((int32_t) s.request.tokens[(size_t) (s.read + t)]);
-            s.read += n; s.prompt_ms += elapsed(start);
-            prefill_ms += elapsed(start);
-            std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) s.read, s.request.tokens.size());
-            std::fflush(stdout);
-            prompt_rotation = (i + 1) % m.slots.size();
-            break;
-        }
+    // The original decode round, also callable while an unrelated prompt owns the shared arena.
+    // No command processing, admission, reset or prefill belongs in this helper.
+    auto decode_ready = [&](const std::vector<Impl::Slot*>* eligible, PrefillYieldBudget* yield_budget) -> bool {
         std::vector<Impl::Slot*> ready;
         std::vector<int> wanted;
         for (size_t j = 0; j < m.slots.size(); ++j) {
             auto& s = *m.slots[(rotation + j) % m.slots.size()];
             if (!s.active || s.read < s.position) continue;
+            if (eligible && std::find(eligible->begin(), eligible->end(), &s) == eligible->end()) continue;
             if (s.position >= c.context) { finish(s, "length"); continue; }
             int n = s.first ? 1 : c.mtp_window_rows;
             if (!s.first && s.request.spec_min_p > 0) {
@@ -457,7 +477,7 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             if (history > 0) {
                 kernels::penalty_rows(s.consumed.data(), (int64_t) s.consumed.size(), s.window, s.count, history, s.history.data());
                 if (cudaMemcpy(s.history_device, s.history.data(), (size_t) s.count * history * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess) {
-                    err = "concurrency: history upload failed"; return 1;
+                    err = "concurrency: history upload failed"; return false;
                 }
             }
             s.verify.set_history(history ? s.history_device : nullptr, history);
@@ -473,11 +493,31 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                     for (auto& w : windows)
                         w.count = (int) std::min<int64_t>(std::max(w.count, c.mtp_window_rows), c.context - w.position);
             }
-            // Stable packing order avoids recapturing a graph merely because fairness rotated the request order.
-            std::sort(windows.begin(), windows.end(), [](const auto& a, const auto& b) {
-                return std::less<core::Verifier*>{}(a.verifier, b.verifier);
+            // Logical slot order is stable across launches. Heap-address order can
+            // change packed row/reduction order and hence floating-point rounding.
+            // Concurrent PCIe miss offload is currently disabled (pcie_num is zero).
+            // Fairness still rotates admission; packing must not rotate with it.
+            auto slot_index = [&](const core::Verifier* verifier) {
+                for (size_t i = 0; i < m.slots.size(); ++i)
+                    if (&m.slots[i]->verify == verifier) return i;
+                return m.slots.size();
+            };
+            std::sort(windows.begin(), windows.end(), [&](const auto& a, const auto& b) {
+                return slot_index(a.verifier) < slot_index(b.verifier);
             });
             const auto start = Clock::now();
+            if (trace_rounds) {
+                std::fprintf(stderr, "round-order %lld", (long long) rounds);
+                for (const auto& w : windows) for (auto* s : ready) if (&s->verify == w.verifier)
+                    std::fprintf(stderr, " %llu:%d", (unsigned long long) s->request.id, w.count);
+                std::fprintf(stderr, "\n");
+            }
+            if (trace_rounds) for (auto* s : ready) {
+                std::fprintf(stderr, "round-input %lld id=%llu pos=%lld count=%d lookup=%d tokens=",
+                             (long long) rounds, (unsigned long long) s->request.id, (long long) s->position, s->count, s->lookup);
+                for (int t = 0; t < s->count; ++t) std::fprintf(stderr, "%s%d", t ? "," : "", s->window[t]);
+                std::fprintf(stderr, "\n");
+            }
             dispatch.failed = false;
             bool ok;
             if (windows.size() == 1) {
@@ -490,21 +530,41 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
             }
             if (!ok || dispatch.failed) {
                 if (dispatch.failed) err = dispatch.fail ? dispatch.fail : "expert dispatch failed";
-                return 1;
+                return false;
             }
             target_ms += elapsed(start);
+            if (trace_rounds) for (auto* s : ready) {
+                std::fprintf(stderr, "round-output %lld id=%llu tokens=", (long long) rounds, (unsigned long long) s->request.id);
+                for (int t = 0; t < s->count; ++t) std::fprintf(stderr, "%s%d", t ? "," : "", s->output[t]);
+                std::fprintf(stderr, "\n");
+            }
             for (const auto& w : windows) target_rows += w.count;
+            std::vector<core::MtpDrafter::DraftRound> draft_rounds;
             for (auto* ptr : ready) {
                 auto& s = *ptr; if (!s.count) continue;
                 int accepted = 0;
                 while (accepted < s.count - 1 && s.window[accepted + 1] == s.output[accepted]) ++accepted;
                 int keep = accepted + 1;
+                const auto forced_it = forced.find(s.request.id);
+                if (forced_it != forced.end()) {
+                    if ((size_t)s.generated >= forced_it->second.size()) { err = "diagnostic: continuation exhausted"; return false; }
+                    if (s.generated % 16 == 0) {
+                        std::vector<float> logits;
+                        if (!s.verify.diagnostic_logits(logits, err)) return false;
+                        const uint64_t header[] = {s.request.id, (uint64_t)s.generated, (uint64_t)s.position, (uint64_t)logits.size()};
+                        numerical_trace.write((const char*)header, sizeof(header));
+                        numerical_trace.write((const char*)logits.data(), logits.size() * sizeof(float));
+                        if (!numerical_trace) { err = "diagnostic: logits write failed"; return false; }
+                    }
+                    s.output[0] = forced_it->second[(size_t)s.generated];
+                    keep = 1;
+                }
                 bool eos = false;
                 for (int t = 0; t < keep; ++t) if (std::find(c.eos.begin(), c.eos.end(), s.output[t]) != c.eos.end()) {
                     keep = t + 1; eos = true; break;
                 }
                 const auto commit_start = Clock::now();
-                if (!s.verify.commit(keep, err)) return 1;
+                if (!s.verify.commit(keep, err)) return false;
                 commit_ms += elapsed(commit_start);
                 produced += keep;
                 s.offered += s.count - 1; s.accepted += keep - 1;
@@ -520,24 +580,153 @@ int ConcurrentServe::run(const core::WeightTable& wt, const core::NativeHead* he
                 // Catch-up consumes the verified window; limit the extra speculative chain near the context boundary.
                 s.draft->set_max_drafts((int) std::min<int64_t>(c.mtp_window_rows - 1, c.context - (s.position + keep)));
                 const auto draft_start = Clock::now();
-                if (!s.draft->draft(s.count, s.output, s.position, keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return 1;
+                if (parallel_drafts)
+                    draft_rounds.push_back({s.draft, s.count, s.output, s.position, keep - 1, s.drafts, s.probability, s.request.spec_min_p});
+                else if (!s.draft->draft(s.count, s.output, s.position, keep - 1, s.drafts, err, s.probability, s.request.spec_min_p)) return false;
                 draft_ms += elapsed(draft_start);
-                s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(start));
+                if (!parallel_drafts) s.policy.observe(s.lookup, s.count, keep - 1, s.match, elapsed(start));
                 s.current = s.output[keep - 1]; s.position += keep; s.read = s.position;
+            }
+            if (!draft_rounds.empty()) {
+                const auto draft_start = Clock::now();
+                if (!core::MtpDrafter::draft_batch(draft_rounds, err)) return false;
+                draft_ms += elapsed(draft_start);
+                // Include drafting in the policy's observed round cost in both modes.
+                for (const auto& r : draft_rounds) for (auto* s : ready) if (s->draft == r.drafter)
+                    s->policy.observe(s->lookup, r.count, r.accepted, s->match, elapsed(start));
             }
             ++rounds;
             if (adaptive && rounds % c.adapt_every == 0) {
-                const auto adapt_start = Clock::now();
-                if (!adapt()) return 1;
-                adapt_ms += elapsed(adapt_start);
+                if (yield_budget) yield_budget->defer_adaptation();
+                else {
+                    const auto adapt_start = Clock::now();
+                    if (!adapt()) return false;
+                    adapt_ms += elapsed(adapt_start);
+                }
             }
             if (rounds % 64 == 0) report_profile();
         }
+        return true;
+    };
+    bool quitting = false;
+    while (!quitting) {
+        core::progress().busy.store(!live.empty());
+        std::deque<std::string> commands;
+        {
+            std::unique_lock<std::mutex> lock(input->mutex);
+            if (live.empty() && pending.empty()) input->cv.wait(lock, [&] { return !input->lines.empty() || input->eof; });
+            commands.swap(input->lines);
+            if (input->eof && commands.empty()) quitting = true;
+            input->cv.notify_all();
+        }
+        for (const auto& line : commands) {
+            if (line == "QUIT") { quitting = true; break; }
+            if (line.rfind("CSTOP ", 0) == 0) {
+                uint64_t id = 0; std::istringstream(line.substr(6)) >> id;
+                for (auto& s : m.slots) if (s->active && s->request.id == id) finish(*s, "cancel");
+                for (auto p = pending.begin(); p != pending.end();) {
+                    if (p->id == id) { error(id, "cancelled before admission"); live.erase(id); p = pending.erase(p); }
+                    else ++p;
+                }
+                continue;
+            }
+            Request request;
+            std::string reason;
+            if (!parse_request(line, c, wt.find("output.weight")->ne1, request, reason)) { error(request.id, reason); continue; }
+            if (forced.count(request.id) && (size_t)request.max_new > forced.at(request.id).size()) {
+                error(request.id, "diagnostic continuation shorter than output cap"); continue;
+            }
+            if (live.count(request.id)) { error(request.id, "duplicate request id"); continue; }
+            if (pending.size() >= 16) { error(request.id, "request queue is full"); continue; }
+            live.insert(request.id);
+            pending.push_back(std::move(request));
+        }
+        if (quitting) break;
+        core::progress().busy.store(!live.empty());
+        for (auto& ptr : m.slots) if (!ptr->active && !pending.empty()) {
+            auto& s = *ptr;
+            s.request = std::move(pending.front()); pending.pop_front();
+            s.read = s.generated = s.offered = s.accepted = 0;
+            s.prompt_ms = 0; s.first = true; s.active = true;
+            s.position = (int64_t) s.request.tokens.size() - 1;
+            s.current = (int32_t) s.request.tokens.back();
+            s.consumed.clear();
+            std::fill(std::begin(s.probability), std::end(s.probability), 0.0f);
+            s.suffix.reset(); s.policy = spec::DraftPolicy{c.window, 0.03, policy_costs};
+            for (auto token : s.request.tokens) s.suffix.append((int32_t) token);
+            core::session_zero(*s.state, g, nullptr, m.prompt_stream);
+            if (cudaStreamSynchronize(m.prompt_stream) != cudaSuccess) { err = "concurrency: reset failed"; return 1; }
+            s.draft->reset(); s.draft->set_prompt_len((int64_t) s.request.tokens.size());
+            s.verify.set_sampling(s.request.sampling);
+        }
+        // At most ONE bounded prompt chunk before returning to ready decoders.
+        core::progress().busy.store(!live.empty());
+        for (size_t j = 0; j < m.slots.size(); ++j) {
+            const size_t i = (prompt_rotation + j) % m.slots.size();
+            auto& s = *m.slots[i];
+            if (!s.active || s.read >= s.position) continue;
+            const auto start = Clock::now();
+            const auto n = std::min<int64_t>(c.prefill_chunk, s.position - s.read);
+            if (!prefill_yield) {
+                if (!s.prompt.run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
+            } else {
+                // Freeze eligibility before suspending: no new request can enter the callback.
+                std::vector<Impl::Slot*> eligible;
+                for (auto& ptr : m.slots)
+                    if (ptr.get() != &s && ptr->active && ptr->read >= ptr->position)
+                        eligible.push_back(ptr.get());
+                PrefillYieldBudget budget(yield_interval_ms);
+                struct ClearYield {
+                    prefill::Prefill& prompt;
+                    ~ClearYield() { prompt.yield_requested = {}; prompt.on_yield = {}; }
+                } clear_yield{s.prompt};
+                if (!eligible.empty()) {
+                    s.prompt.yield_requested = [&]() {
+                        const bool ready = std::any_of(eligible.begin(), eligible.end(),
+                            [](const auto* slot) { return slot->active && slot->read >= slot->position; });
+                        return budget.due(elapsed(start), ready);
+                    };
+                    s.prompt.on_yield = [&](std::string& callback_err) {
+                        const auto yield_start = Clock::now();
+                        // The callback error aliases run's err. A failed round aborts this prompt and server.
+                        if (!decode_ready(&eligible, &budget)) {
+                            if (callback_err.empty()) callback_err = "concurrency: prefill yield decode failed";
+                            return false;
+                        }
+                        rotation = (rotation + 1) % m.slots.size();
+                        ++yield_calls;
+                        yield_decode_ms += elapsed(yield_start);
+                        budget.serviced(elapsed(start));
+                        return true;
+                    };
+                }
+                if (!s.prompt.run(s.request.tokens.data() + s.read, n, s.read, err)) return 1;
+                // The target chunk, its copy stream, and the on_chunk MTP prefill have all completed.
+                // Coalesce deadlines; never replay stale swap plans or mutate residency under Prefill.
+                if (budget.take_adaptation()) {
+                    ++yield_adaptations;
+                    const auto adapt_start = Clock::now();
+                    if (!adapt()) return 1;
+                    adapt_ms += elapsed(adapt_start);
+                }
+            }
+            for (int64_t t = 0; t < n; ++t) s.consumed.push_back((int32_t) s.request.tokens[(size_t) (s.read + t)]);
+            s.read += n; s.prompt_ms += elapsed(start);
+            prefill_ms += elapsed(start);
+            std::printf("R %llu PP %lld %zu\n", (unsigned long long) s.request.id, (long long) s.read, s.request.tokens.size());
+            std::fflush(stdout);
+            prompt_rotation = (i + 1) % m.slots.size();
+            break;
+        }
+        if (!decode_ready(nullptr, nullptr)) return 1;
         rotation = (rotation + 1) % m.slots.size();
     }
     for (auto& s : m.slots) if (s->active) finish(*s, "cancel");
     for (const auto& r : pending) error(r.id, "server shutting down");
     report_profile();
+    if (prefill_yield)
+        std::fprintf(stderr, "strata concurrent prefill yield: calls=%lld decode_ms=%.1f deferred_adaptations=%lld\n",
+                     (long long) yield_calls, yield_decode_ms, (long long) yield_adaptations);
     std::fprintf(stderr, "strata concurrent: target rounds by active batch size: 1=%lld 2=%lld 3=%lld 4=%lld\n",
                  (long long) batch_sizes[1], (long long) batch_sizes[2], (long long) batch_sizes[3], (long long) batch_sizes[4]);
     return 0;
