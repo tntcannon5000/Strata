@@ -1,3 +1,4 @@
+#include "strata/core/mrope_scope.hpp"
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/mtp.hpp"
@@ -366,6 +367,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
     if (!impl_) return;
+    const core::OnDevice on_device(impl_->device);
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     for (int i = 0; i < RING_MAX; ++i) {
@@ -931,11 +933,16 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
     const core::OnDevice on_device(m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
+    const core::MropeScope mrope(ss.mrope);
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
     if (yield_requested || on_yield) {
-        if (!yield_requested || !on_yield || m.T > 1024 || LB != 0 || LE != g.n_layers || next_ != nullptr) {
-            err = "prefill yield: requires paired callbacks, one device and a chunk of at most 1024";
+        // In a layer split, one bounded chunk drains each parent before the
+        // child starts. Multi-chunk pipelining could leave another stage active
+        // when the callback enters decode, so it is deliberately excluded.
+        if (!yield_requested || !on_yield || m.T > 1024 ||
+            ((LB != 0 || LE != g.n_layers || next_ != nullptr) && n > m.T)) {
+            err = "prefill yield: requires paired callbacks and one bounded chunk of at most 1024";
             return false;
         }
     }
